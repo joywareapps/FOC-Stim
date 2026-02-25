@@ -536,7 +536,7 @@ void loop()
     static Clock potentiometer_notification_nospam;
     static float potentiometer_notification_lastvalue = 0;
     static bool volume_locked = false;
-    static float locked_potmeter_value = 1.0f;
+    static float locked_potmeter_value = 0.0f;
     static uint32_t button_press_start_time = 0;
     static bool last_button_state = true; // active low (pullup)
 

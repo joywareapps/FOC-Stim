@@ -42,7 +42,9 @@ public:
         float temperature, bool usb5v_present);
     void transmit_notification_lsm6dsox(int acc_x, int acc_y, int acc_z, int gyr_x, int gyr_y, int gyr_z);
     void transmit_notification_pressure(float pressure);
+#if defined(BOARD_FOCSTIM_V4)
     void transmit_notification_button_press(bool pressed);
+#endif
 
     void transmit_error_response(focstim_rpc_Errors errorcode, uint32_t id);
 
