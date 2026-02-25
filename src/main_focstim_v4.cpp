@@ -535,9 +535,42 @@ void loop()
 
     static Clock potentiometer_notification_nospam;
     static float potentiometer_notification_lastvalue = 0;
+    static bool volume_locked = false;
+    static float locked_potmeter_value = 1.0f;
+    static uint32_t button_press_start_time = 0;
+    static bool last_button_state = true; // active low (pullup)
 
     // do comms
     protobuf.process_incoming_messages();
+
+    // button and volume lock logic
+    bool current_button_state = BSP_ReadEncoderButton();
+    if (current_button_state != last_button_state) {
+        last_button_state = current_button_state;
+        bool pressed = (current_button_state == false);
+        protobuf.transmit_notification_button_press(pressed);
+
+        if (pressed) {
+            button_press_start_time = millis();
+        } else {
+            button_press_start_time = 0;
+        }
+    }
+
+    if (button_press_start_time != 0) {
+        if ((millis() - button_press_start_time) > 2000) {
+            volume_locked = !volume_locked;
+            user_interface.setLocked(volume_locked);
+            if (volume_locked) {
+                locked_potmeter_value = powf(BSP_ReadPotentiometerPercentage(), 1.f/2);
+            }
+            button_press_start_time = 0; // prevent repeated toggling
+            BSP_PrintDebugMsg("Volume %s", volume_locked ? "LOCKED" : "UNLOCKED");
+            // notify UI about the lock state change via a debug string for now
+            // since we don't have a specific lock notification yet
+            protobuf.transmit_notification_debug_string("LOCK:%d", volume_locked ? 1 : 0);
+        }
+    }
 
     // safety: temperature
     float temperature = BSP_ReadTemperatureSTM();
@@ -727,8 +760,13 @@ void loop()
     traceline->dt_next = pulse_total_duration * 1e6f;
 
     // mix in potmeter
-    float potmeter_value = BSP_ReadPotentiometerPercentage();
-    potmeter_value = powf(potmeter_value, 1.f/2);
+    float potmeter_value;
+    if (volume_locked) {
+        potmeter_value = locked_potmeter_value;
+    } else {
+        potmeter_value = BSP_ReadPotentiometerPercentage();
+        potmeter_value = powf(potmeter_value, 1.f/2);
+    }
     body_current_amps *= potmeter_value;
 
     // calculate amplitude in amperes (driving current)

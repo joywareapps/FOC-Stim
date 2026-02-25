@@ -193,6 +193,15 @@ void ProtobufAPI::transmit_notification_pressure(float pressure)
     transmit_message(message);
 }
 
+void ProtobufAPI::transmit_notification_button_press(bool pressed)
+{
+    focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
+    message.which_message = focstim_rpc_RpcMessage_notification_tag;
+    message.message.notification.which_notification = focstim_rpc_Notification_notification_button_press_tag;
+    message.message.notification.notification.notification_button_press.pressed = pressed;
+    transmit_message(message);
+}
+
 void ProtobufAPI::transmit_error_response(focstim_rpc_Errors errorcode, uint32_t id)
 {
     focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
