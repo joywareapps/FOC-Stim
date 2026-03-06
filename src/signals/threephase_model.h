@@ -18,7 +18,7 @@ public:
         Complex p1, Complex p2, Complex p3,
         float carrier_frequency,
         float pulse_width, float rise_time,
-        float estop_current_limit);
+        float estop_current_limit, float max_allowed_vdrive);
 
     Vec3f estimate_rms_current(float dt);
 
@@ -26,7 +26,7 @@ public:
 
     void interrupt_fn();
     void accumulate_errors();
-    void model_update(Complex p1, Complex p2, Complex p3, Complex v1, Complex v2, Complex v4);
+    void model_update(Complex p1, Complex p2, Complex p3);
 
     Complex z1 = Complex(0, 0); // impedance of first output
     Complex z2 = Complex(0, 0); // impedance of second output
@@ -38,7 +38,8 @@ public:
         Vec3f current_max = Vec3f(0, 0, 0);
         float v_bus_min = 0;    // the min/max bus voltage observed during the pulse
         float v_bus_max = 0;
-        float v_drive = 0;      // v_drive of the pulse
+        float v_drive_requested = 0;
+        float v_drive_actual = 0;      // v_drive of the pulse
         float volt_seconds = 0;
     } pulse_stats;
 
@@ -46,6 +47,7 @@ public:
     struct {
         Vec3f current_squared = Vec3f(0, 0, 0);
         Vec3f current_max = Vec3f(0, 0, 0);
+        float volt_seconds;
     } total_stats;
 
 
@@ -98,9 +100,9 @@ public:
     Complex phase_IQ_2 = {};
     Complex phase_IQ_3 = {};
 
-    Complex phase_IQ_sum_1 = {};
-    Complex phase_IQ_sum_2 = {};
-    Complex phase_IQ_sum_3 = {};
+    Complex phase_IQ_avg_1 = {};
+    Complex phase_IQ_avg_2 = {};
+    Complex phase_IQ_avg_3 = {};
 
     Vec3f integrated_cmd = {};
     Vec3f integrated_meas = {};

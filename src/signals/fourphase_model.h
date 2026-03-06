@@ -21,7 +21,7 @@ public:
         Complex p1, Complex p2, Complex p3, Complex p4,
         float carrier_frequency,
         float pulse_width, float rise_time,
-        float estop_current_limit);
+        float estop_current_limit, float max_allowed_vdrive);
 
     Vec4f estimate_rms_current(float dt);
 
@@ -29,7 +29,7 @@ public:
 
     void interrupt_fn();
     void accumulate_errors();
-    void model_update(Complex p1, Complex p2, Complex p3, Complex p4, Complex v1, Complex v2, Complex v3, Complex v4);
+    void model_update(Complex p1, Complex p2, Complex p3, Complex p4);
 
     // electrode impedance
     Complex z1 = Complex(0, 0);
@@ -44,7 +44,8 @@ public:
         Vec4f current_max = Vec4f(0, 0, 0, 0);
         float v_bus_min = 0;    // the min/max bus voltage observed during the pulse
         float v_bus_max = 0;
-        float v_drive = 0;      // v_drive of the pulse
+        float v_drive_requested = 0;
+        float v_drive_actual = 0;         // v_drive of the pulse
         float volt_seconds = 0;
     } pulse_stats;
 
@@ -52,6 +53,7 @@ public:
     struct {
         Vec4f current_squared = Vec4f(0, 0, 0, 0);
         Vec4f current_max = Vec4f(0, 0, 0, 0);
+        float volt_seconds;
     } total_stats;
 
     static constexpr int CONTEXT_SIZE = 256;
@@ -111,10 +113,10 @@ public:
     Complex phase_IQ_3 = {};
     Complex phase_IQ_4 = {};
 
-    Complex phase_IQ_sum_1 = {};
-    Complex phase_IQ_sum_2 = {};
-    Complex phase_IQ_sum_3 = {};
-    Complex phase_IQ_sum_4 = {};
+    Complex phase_IQ_avg_1 = {};
+    Complex phase_IQ_avg_2 = {};
+    Complex phase_IQ_avg_3 = {};
+    Complex phase_IQ_avg_4 = {};
 
     Vec4f integrated_cmd = {};
     Vec4f integrated_meas = {};

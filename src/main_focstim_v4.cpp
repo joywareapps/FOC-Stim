@@ -12,14 +12,16 @@
 #include "signals/fourphase_math_2.h"
 #include "signals/fourphase_model.h"
 #include "battery/power_manager.h"
+#include "battery/boost_control.h"
 #include <Wire.h>
-#include "axis/buffered_axis.h"
 #include "axis/simple_axis.h"
 #include "timestamp_sync.h"
 #include "sensors/as5311.h"
 #include "sensors/imu.h"
 #include "sensors/pressure.h"
 #include "user_interface/user_interface.h"
+#include "user_interface/encoder.h"
+#include "user_interface/button.h"
 #include "esp32.h"
 #include "foc_error.h"
 
@@ -38,6 +40,9 @@ ESP32 esp32;
 IMU imu;
 AS5311 as5311{};
 PressureSensor pressureSensor{};
+Encoder encoder{};
+Button button{};
+BoostControl boostControl{};
 
 
 enum PlayStatus{
@@ -74,8 +79,7 @@ public:
         }
         // transmit_notification_debug_string("START 3");
 
-        time_since_signal_start.reset();
-        BSP_SetBoostEnable(true);
+        boostControl.play_started();
         BSP_WriteLedPattern(LedPattern::PlayingVeryLow);
         play_status = PlayStatus::PlayingThreephase;
         user_interface.setState(UserInterface::Playing);
@@ -90,8 +94,7 @@ public:
 
         // transmit_notification_debug_string("START 4");
 
-        time_since_signal_start.reset();
-        BSP_SetBoostEnable(true);
+        boostControl.play_started();
         BSP_WriteLedPattern(LedPattern::PlayingVeryLow);
         play_status = PlayStatus::PlayingFourphase;
         user_interface.setState(UserInterface::Playing);
@@ -102,7 +105,7 @@ public:
     {
         // transmit_notification_debug_string("STOP");
 
-        BSP_SetBoostEnable(false);
+        boostControl.play_stopped();
         BSP_WriteLedPattern(LedPattern::Idle);
         user_interface.setState(UserInterface::Idle);   // TOOD: force display update
         play_status = PlayStatus::NotPlaying;
@@ -127,9 +130,39 @@ public:
         return focstim_rpc_Errors_ERROR_UNKNOWN;
     }
 
+    virtual focstim_rpc_Errors lock_device_volume(bool locked) {
+        encoder.setLocked(locked);
+        return focstim_rpc_Errors_ERROR_UNKNOWN;
+    }
+
+    virtual void before_bootloader() {
+        // hardware bug: when in bootloader mode, the driver pins are configured
+        // in such a way that one driver is enabled. This causes current flow
+        // that saturates the transformer and repeatedly hits the current limit
+        // of the driver.
+        // mitigation: drain the boost circuit caps before entering bootloader.
+        BSP_SetBoostVoltage(0);         // disable boost circuit
+        BSP_SetBoostEnable(false);
+        BSP_SetPWM4Atomic(0, 0, 0, 0);
+        BSP_OutputEnable(1, 1, 1, 1);   // enable all drivers to drain all the energy in the boost caps
+        Clock k;
+        while (BSP_ReadVBus() > 6) {    // drain to 6v
+            k.step();
+            if (k.time_seconds > 1) {
+                // give up after 1 second
+                break;
+            }
+        }
+        BSP_DisableOutputs();
+
+        user_interface.setState(UserInterface::FirmwareUpdate);
+        user_interface.repaint();
+        user_interface.full_update();
+    }
+
     virtual bool capability_threephase() {return true;};
     virtual bool capability_fourphase() {return true;};
-    virtual bool capability_potmeter() {return true;};
+    virtual bool capability_device_volume() {return true;};
     virtual bool capability_battery() {return power_manager.is_battery_present;};
     virtual bool capability_lsm6dsox() {return imu.is_sensor_detected;};
 
@@ -151,7 +184,6 @@ public:
         transmit_message(message);
     }
 
-    Clock time_since_signal_start;
 };
 
 FocstimV4ProtobufAPI protobuf{};
@@ -459,10 +491,14 @@ void self_test() {
     BSP_PrintDebugMsg("self test completed");
 }
 
+// called before clock initialization
+void pre_setup()
+{
+    BSP_CheckJumpToBootloader();
+}
 
 void setup()
 {
-    BSP_CheckJumpToBootloader();
     Serial.begin(115200, SERIAL_8E1);   // match STM32 bootloader setting
     Wire.setSCL(PA15);
     Wire.setSDA(PB9);
@@ -505,9 +541,6 @@ void setup()
     user_interface.repaint();
     user_interface.full_update();
 
-    // TODO: dynamic
-    BSP_SetBoostVoltage(STIM_BOOST_VOLTAGE);
-
     model3.init(&trigger_emergency_stop);
     model4.init(&trigger_emergency_stop);
 
@@ -532,9 +565,11 @@ void loop()
     static float v_boost_min = 99;
     static float v_boost_max = 0;
     static Clock ip_refresh_clock;
+    static Clock boost_not_ready_clock;
+    static bool boost_is_ready = false;
 
-    static Clock potentiometer_notification_nospam;
-    static float potentiometer_notification_lastvalue = 0;
+    static Clock device_volume_nospam;
+    static float device_volume_last_value = 0;
 
     // do comms
     protobuf.process_incoming_messages();
@@ -545,7 +580,6 @@ void loop()
         trigger_emergency_stop(FOCError::BOARD_OVER_TEMPERATURE);
         while (1)
         {
-            BSP_WriteLedPattern(LedPattern::Error);
             BSP_PrintDebugMsg(
                 "temperature limit exceeded %.2f. Current temperature=%.2f. Restart device to proceed.",
                 temperature, BSP_ReadTemperatureSTM());
@@ -557,34 +591,14 @@ void loop()
     v_boost_min = min(v_boost_min, vbus);
     v_boost_max = max(v_boost_max, vbus);
     // safety: boost overvoltage
-    if (vbus >= STIM_BOOST_OVERVOLTAGE_THRESHOLD) {
+    if (vbus >= BOOST_OVERVOLTAGE_THRESHOLD) {
         trigger_emergency_stop(FOCError::BOOST_OVER_VOLTAGE);
         while (1)
         {
-            BSP_WriteLedPattern(LedPattern::Error);
             BSP_PrintDebugMsg(
                 "boost overvoltage detected %.2f. Current boost=%.2f. Restart device to proceed.",
                 vbus, BSP_ReadVBus());
             delay(5000);
-        }
-    }
-
-    // safety: boost undervoltage
-    if (vbus <= STIM_BOOST_UNDERVOLTAGE_THRESHOLD) {
-        if (play_status != PlayStatus::NotPlaying) {
-            protobuf.time_since_signal_start.step();
-            if (protobuf.time_since_signal_start.time_seconds >= 0.5f) {
-                trigger_emergency_stop(FOCError::BOOST_UNDER_VOLTAGE);
-                trace.print_mainloop_trace();
-                while (1)
-                {
-                    BSP_WriteLedPattern(LedPattern::Error);
-                    BSP_PrintDebugMsg(
-                        "boost undervoltage detected %.2f. Current boost=%.2f. Restart device to proceed.",
-                        vbus, BSP_ReadVBus());
-                    delay(5000);
-                }
-            }
         }
     }
 
@@ -598,20 +612,42 @@ void loop()
         }
     }
 
-    // transmit potmeter notification
-    potentiometer_notification_nospam.step();
-    bool do_transmit_potmeter = false;
-    do_transmit_potmeter |= (potentiometer_notification_nospam.time_seconds > 1);
-    do_transmit_potmeter |= (potentiometer_notification_nospam.time_seconds > 0.1f
-        && abs(BSP_ReadPotentiometerPercentage() - potentiometer_notification_lastvalue) >= 0.001f);
-    if (do_transmit_potmeter) {
-        float pot = BSP_ReadPotentiometerPercentage();
-        protobuf.transmit_notification_potentiometer(powf(pot, 1.f/2));
-        potentiometer_notification_nospam.reset();
-        potentiometer_notification_lastvalue = pot;
-
-        user_interface.setPowerLevel(powf(pot, 1.f/2) * 100);
+    // encoder stuff
+    encoder.update();
+    device_volume_nospam.step();
+    bool do_transmit_device_volume = false;
+    do_transmit_device_volume |= (device_volume_nospam.time_seconds > 1);
+    do_transmit_device_volume |= (device_volume_nospam.time_seconds > 0.1f
+        && (encoder.volume() != device_volume_last_value));
+    if (do_transmit_device_volume) {
+        device_volume_nospam.reset();
+        device_volume_last_value = encoder.volume();
+        protobuf.transmit_notification_device_volume(encoder.volume(), encoder.isLocked());
     }
+
+    // process button events
+    switch (button.getEvent()) {
+        case ButtonEvent::Press:
+            protobuf.transmit_notification_button_press(true, millis());
+            break;
+        case ButtonEvent::Release:
+            protobuf.transmit_notification_button_press(false, millis());
+        break;
+        default:
+        break;
+    };
+
+    // process encoder quick-turns
+    if (encoder.isLocked()) {
+        if (encoder.isQuickTurned()) {
+            encoder.setLocked(false);
+            encoder.resetVolume();
+            protobuf.transmit_notification_device_volume(encoder.volume(), encoder.isLocked());
+        }
+    }
+    user_interface.setLockState(encoder.isLocked());
+    user_interface.setUnlockProgress(encoder.unlockProgress());
+    user_interface.setPowerLevel(encoder.volume());
 
     // every few seconds, print system stats
     print_system_stats_clock.step();
@@ -650,6 +686,7 @@ void loop()
 
     // start/stop
     if (play_status == PlayStatus::NotPlaying) {
+        boost_not_ready_clock.reset();
         BSP_WriteLedPattern(LedPattern::Idle);
         return;
     }
@@ -660,8 +697,7 @@ void loop()
         play_status = PlayStatus::NotPlaying;
         BSP_WriteLedPattern(LedPattern::Idle);
         user_interface.setState(UserInterface::Idle);
-        BSP_DisableOutputs();
-        BSP_SetBoostEnable(false);
+        boostControl.play_stopped();
         imu.stop_stream();
         return;
     }
@@ -673,12 +709,28 @@ void loop()
     }
 
     // delay pulse until the boost capacitors are filled up, reducing the pulse frequency if neccesairy
-    if (vbus <= STIM_BOOST_VOLTAGE_OK_THRESHOLD) {
-        if (protobuf.time_since_signal_start.time_seconds >= 0.5f) {
-            BSP_PrintDebugMsg("boost too low: %u %f %f", micros(), vbus, BSP_ReadVSYS());
+    if (! boostControl.boost_is_ready()) {
+        if (boost_is_ready) {
+            boost_is_ready = false;
+            boost_not_ready_clock.reset();
+        }
+
+        // if it takes excessively long to charge the boost caps, trigger undervoltage error.
+        boost_not_ready_clock.step();
+        if (boost_not_ready_clock.time_seconds > 0.1f) {
+            trigger_emergency_stop(FOCError::BOOST_UNDER_VOLTAGE);
+            trace.print_mainloop_trace();
+            while (1)
+            {
+                BSP_PrintDebugMsg(
+                    "boost undervoltage detected %.2f. Current boost=%.2f. Restart device to proceed.",
+                    vbus, BSP_ReadVBus());
+                delay(5000);
+            }
         }
         return;
     }
+    boost_is_ready = true;
 
     // ready to generate next pulse!
     MainLoopTraceLine *traceline = trace.next_main_loop_line();
@@ -726,10 +778,8 @@ void loop()
     pulse_total_duration = pulse_active_duration + pulse_pause_duration;
     traceline->dt_next = pulse_total_duration * 1e6f;
 
-    // mix in potmeter
-    float potmeter_value = BSP_ReadPotentiometerPercentage();
-    potmeter_value = powf(potmeter_value, 1.f/2);
-    body_current_amps *= potmeter_value;
+    // mix in encoder
+    body_current_amps *= encoder.volume();
 
     // calculate amplitude in amperes (driving current)
     float driving_current_amps = body_current_amps * STIM_WINDING_RATIO;
@@ -776,9 +826,12 @@ void loop()
         model3.play_pulse(points3.p1, points3.p2, points3.p3,
                           pulse_carrier_frequency,
                           pulse_width, pulse_rise,
-                          driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN);
+                          driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN,
+                          boostControl.max_allowed_vdrive());
 
         BSP_DisableOutputs();
+
+        boostControl.update(model3.pulse_stats.v_drive_requested, model3.pulse_stats.v_bus_min);
     } else if (play_status == PlayStatus::PlayingFourphase) {
         ComplexFourphasePoints points4 = project_fourphase_2(
             driving_current_amps,
@@ -795,9 +848,11 @@ void loop()
         model4.play_pulse(points4.p1, points4.p2, points4.p3, points4.p4,
                           pulse_carrier_frequency,
                           pulse_width, pulse_rise,
-                          driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN);
+                          driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN,
+                          boostControl.max_allowed_vdrive());
 
         BSP_DisableOutputs();
+        boostControl.update(model4.pulse_stats.v_drive_requested, model4.pulse_stats.v_bus_min);
     }
 
     // store stats
@@ -813,8 +868,8 @@ void loop()
     {
         if (play_status == PlayStatus::PlayingThreephase) {
             traceline->skipped_update_steps = model3.skipped_update_steps;
-            traceline->v_drive = model3.pulse_stats.v_drive;
-            v_drive_max = max(v_drive_max, model3.pulse_stats.v_drive);
+            traceline->v_drive = model3.pulse_stats.v_drive_actual;
+            v_drive_max = max(v_drive_max, model3.pulse_stats.v_drive_actual);
 
             auto current_max = model3.pulse_stats.current_max;
             traceline->i_max_a = current_max.a;
@@ -830,8 +885,8 @@ void loop()
 
         } else {
             traceline->skipped_update_steps = model4.skipped_update_steps;
-            traceline->v_drive = model4.pulse_stats.v_drive;
-            v_drive_max = max(v_drive_max, model4.pulse_stats.v_drive);
+            traceline->v_drive = model4.pulse_stats.v_drive_actual;
+            v_drive_max = max(v_drive_max, model4.pulse_stats.v_drive_actual);
 
             auto current_max = model4.pulse_stats.current_max;
             traceline->i_max_a = current_max.a;
@@ -929,8 +984,20 @@ void loop()
 
     // send notification: pulse stats
     if (pulse_counter % 50 == 40) {
-        // transmit_notification
-        protobuf.transmit_notification_signal_stats(actual_pulse_frequency, v_drive_max);
+        float volt_seconds = 0;
+        if (play_status == PlayStatus::PlayingThreephase) {
+            volt_seconds = model3.total_stats.volt_seconds;
+            model3.total_stats.volt_seconds = 0;
+        } else if (play_status == PlayStatus::PlayingFourphase) {
+            volt_seconds = model4.total_stats.volt_seconds;
+            model4.total_stats.volt_seconds = 0;
+        }
+
+        protobuf.transmit_notification_signal_stats(
+            actual_pulse_frequency,
+            v_drive_max,
+            std::min(1.f, volt_seconds / MODEL_MAXIMUM_VOLT_SECONDS),
+            std::min(1.f, boostControl.utilizaton_percent(v_drive_max)));
         v_drive_max = 0;
     }
 }

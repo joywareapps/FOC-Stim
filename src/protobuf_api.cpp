@@ -94,12 +94,13 @@ void ProtobufAPI::transmit_notification_boot()
     transmit_message(message);
 };
 
-void ProtobufAPI::transmit_notification_potentiometer(float value)
+void ProtobufAPI::transmit_notification_device_volume(float value, bool locked)
 {
     focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
     message.which_message = focstim_rpc_RpcMessage_notification_tag;
-    message.message.notification.which_notification = focstim_rpc_Notification_notification_potentiometer_tag;
-    message.message.notification.notification.notification_potentiometer.value = value;
+    message.message.notification.which_notification = focstim_rpc_Notification_notification_device_volume_tag;
+    message.message.notification.notification.notification_device_volume.volume = value;
+    message.message.notification.notification.notification_device_volume.locked = locked;
     transmit_message(message);
 };
 
@@ -146,12 +147,14 @@ void ProtobufAPI::transmit_notification_model_estimation(
     transmit_message(message);
 }
 
-void ProtobufAPI::transmit_notification_signal_stats(float actual_pulse_frequency, float v_drive) {
+void ProtobufAPI::transmit_notification_signal_stats(float actual_pulse_frequency, float v_drive, float transformer_utilization, float voltage_utilization) {
     focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
     message.which_message = focstim_rpc_RpcMessage_notification_tag;
     message.message.notification.which_notification = focstim_rpc_Notification_notification_signal_stats_tag;
     message.message.notification.notification.notification_signal_stats.actual_pulse_frequency = actual_pulse_frequency;
     message.message.notification.notification.notification_signal_stats.v_drive = v_drive;
+    message.message.notification.notification.notification_signal_stats.transformer_utilization= transformer_utilization;
+    message.message.notification.notification.notification_signal_stats.voltage_utilization = voltage_utilization;
     transmit_message(message);
 }
 
@@ -190,6 +193,18 @@ void ProtobufAPI::transmit_notification_pressure(float pressure)
     message.which_message = focstim_rpc_RpcMessage_notification_tag;
     message.message.notification.which_notification = focstim_rpc_Notification_notification_pressure_tag;
     message.message.notification.notification.notification_pressure.pressure = pressure;
+    transmit_message(message);
+}
+
+void ProtobufAPI::transmit_notification_button_press(bool press, uint32_t timestamp_ms)
+{
+    focstim_rpc_ButtonState state = press ? focstim_rpc_ButtonState_BUTTON_DOWN : focstim_rpc_ButtonState_BUTTON_UP;
+
+    focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
+    message.which_message = focstim_rpc_RpcMessage_notification_tag;
+    message.message.notification.which_notification = focstim_rpc_Notification_notification_button_press_tag;
+    message.message.notification.notification.notification_button_press.state = state;
+    message.message.notification.notification.notification_button_press.timestamp_ms = timestamp_ms;
     transmit_message(message);
 }
 
@@ -384,7 +399,7 @@ void ProtobufAPI::handle_request_capabilities_get(focstim_rpc_RequestCapabilitie
     message.message.response.result.response_capabilities_get.threephase = capability_threephase();
     message.message.response.result.response_capabilities_get.fourphase = capability_fourphase();
     message.message.response.result.response_capabilities_get.battery = capability_battery();
-    message.message.response.result.response_capabilities_get.potentiometer = capability_potmeter();
+    message.message.response.result.response_capabilities_get.device_volume = capability_device_volume();
     message.message.response.result.response_capabilities_get.lsm6dsox = capability_lsm6dsox();
     message.message.response.result.response_capabilities_get.maximum_waveform_amplitude_amps = BODY_CURRENT_MAX;
     transmit_message(message);
@@ -425,6 +440,24 @@ void ProtobufAPI::handle_request_wifi_ip_get(focstim_rpc_RequestWifiIPGet &reque
     if (error == focstim_rpc_Errors_ERROR_UNKNOWN) {
         message.message.response.which_result = focstim_rpc_Response_response_wifi_ip_get_tag;
         message.message.response.result.response_wifi_ip_get.ip = ip;
+    } else {
+        message.message.response.has_error = true;
+        message.message.response.error.code = error;
+    }
+    transmit_message(message);
+}
+
+void ProtobufAPI::handle_request_lock_device_volume(focstim_rpc_RequestLockDeviceVolume &request, uint32_t id)
+{
+    focstim_rpc_Errors error = focstim_rpc_Errors_ERROR_UNKNOWN;
+
+    error = lock_device_volume(request.lock);
+
+    focstim_rpc_RpcMessage message = focstim_rpc_RpcMessage_init_zero;
+    message.which_message = focstim_rpc_RpcMessage_response_tag;
+    message.message.response.id = id;
+    if (error == focstim_rpc_Errors_ERROR_UNKNOWN) {
+        message.message.response.which_result = focstim_rpc_Response_response_lock_device_volume_tag;
     } else {
         message.message.response.has_error = true;
         message.message.response.error.code = error;
@@ -475,6 +508,7 @@ void ProtobufAPI::handle_request_debug_stm32_deep_sleep(focstim_rpc_RequestDebug
 
 void ProtobufAPI::handle_request_debug_enter_bootloader(focstim_rpc_RequestDebugEnterBootloader &request, uint32_t id)
 {
+    before_bootloader();
     BSP_ResetAndJumpToBootloader();
 }
 
@@ -522,6 +556,10 @@ void ProtobufAPI::handle_request(focstim_rpc_Request &request)
 
         case focstim_rpc_Request_request_wifi_ip_get_tag:
             handle_request_wifi_ip_get(request.params.request_wifi_ip_get, id);
+        break;
+
+        case focstim_rpc_Request_request_lock_device_volume_tag:
+            handle_request_lock_device_volume(request.params.request_lock_device_volume, id);
         break;
 
         case focstim_rpc_Request_request_lsm6dsox_start_tag:

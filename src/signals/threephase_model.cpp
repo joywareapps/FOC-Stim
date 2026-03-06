@@ -28,9 +28,9 @@ static float find_v_drive(Complex p1, Complex p2, Complex p3) {
 void ThreephaseModel::init(std::function<void(FOCError)> emergency_stop_fn) {
     this->emergency_stop_fn = emergency_stop_fn;
 
-    phase_IQ_sum_1 = Complex(.1, 0);
-    phase_IQ_sum_2 = Complex(.1, 0);
-    phase_IQ_sum_3 = Complex(.1, 0);
+    phase_IQ_avg_1 = Complex(.1, 0);
+    phase_IQ_avg_2 = Complex(.1, 0);
+    phase_IQ_avg_3 = Complex(.1, 0);
 
     z1 = Complex(MODEL_RESISTANCE_INIT, 0); // impedance of first output
     z2 = Complex(MODEL_RESISTANCE_INIT, 0); // impedance of second output
@@ -41,7 +41,7 @@ void ThreephaseModel::play_pulse(
     Complex p1, Complex p2, Complex p3,
     float carrier_frequency,
     float pulse_width, float rise_time,
-    float estop_current_limit)
+    float estop_current_limit, float max_allowed_vdrive)
 {
     if (std::abs(p1 + p2 + p3) > .001f) {
         BSP_PrintDebugMsg("Invalid pulse coordinates");
@@ -74,7 +74,8 @@ void ThreephaseModel::play_pulse(
     pulse_stats.current_max = {0, 0, 0};
     pulse_stats.v_bus_min = 99;
     pulse_stats.v_bus_max = 0;
-    pulse_stats.v_drive = 0;
+    pulse_stats.v_drive_requested = 0;
+    pulse_stats.v_drive_actual = 0;
 
     // make debug easier by clearing out stale data.
     for (int i = 0; i < CONTEXT_SIZE; i++) {
@@ -91,7 +92,6 @@ void ThreephaseModel::play_pulse(
         float v3 = (std::abs(z3) - MODEL_FIXED_RESISTANCE) * std::abs(p3);
         float max_v = std::max(v1, std::max(v2, v3));
         float volt_seconds = max_v / (2 * float(M_PI) * carrier_frequency);
-        pulse_stats.volt_seconds = volt_seconds;
 
         // reduce the pulse intensity if needed
         if (volt_seconds >= MODEL_MAXIMUM_VOLT_SECONDS) {
@@ -100,7 +100,9 @@ void ThreephaseModel::play_pulse(
             p2 *= factor;
             p3 *= factor;
         }
-        // TODO: more stats
+
+        pulse_stats.volt_seconds = volt_seconds;
+        total_stats.volt_seconds = std::max(total_stats.volt_seconds, volt_seconds);
     }
 
     // compute voltage with these equations:
@@ -115,9 +117,10 @@ void ThreephaseModel::play_pulse(
 
     // check for max vdrive
     float v_drive = find_v_drive(v1, v2, v3);
-    if (v_drive > STIM_PWM_MAX_VDRIVE) {
+    pulse_stats.v_drive_requested = v_drive;
+    if (v_drive > max_allowed_vdrive) {
         // if vdrive is too high, reduce current/voltage
-        float factor = STIM_PWM_MAX_VDRIVE / v_drive;
+        float factor = max_allowed_vdrive / v_drive;
         p1 = p1 * factor;
         p2 = p2 * factor;
         p3 = p3 * factor;
@@ -127,7 +130,7 @@ void ThreephaseModel::play_pulse(
         v3 = v3 * factor;
         v_drive = v_drive * factor;
     }
-    pulse_stats.v_drive = v_drive;
+    pulse_stats.v_drive_actual = v_drive;
 
     // compute pulse length etc.
     int samples = int(STIM_PWM_FREQ * pulse_width / carrier_frequency);
@@ -161,7 +164,6 @@ void ThreephaseModel::play_pulse(
         }
 
         Complex q = proj * envelope.real();
-        Complex q_quadrature = Complex(-q.imag(), q.real());
         proj = proj * rotator;
         context[i % CONTEXT_SIZE].cosine = proj.real();
         context[i % CONTEXT_SIZE].sine = proj.imag();
@@ -171,23 +173,9 @@ void ThreephaseModel::play_pulse(
         context[i % CONTEXT_SIZE].v1_cmd = (v1 * q).real();  // cmd voltage.
         context[i % CONTEXT_SIZE].v2_cmd = (v2 * q).real();
         context[i % CONTEXT_SIZE].v3_cmd = (v3 * q).real();
-        context[i % CONTEXT_SIZE].v1_cmd_quadrature = (v1 * q_quadrature).real();  // cmd voltage.
-        context[i % CONTEXT_SIZE].v2_cmd_quadrature = (v2 * q_quadrature).real();
-        context[i % CONTEXT_SIZE].v3_cmd_quadrature = (v3 * q_quadrature).real();
-
-#if defined(DEADTIME_COMPENSATION_ENABLE)
-        // note1: This does not result in current flow if all voltages are zero or very close to zero.
-        // note2: Assumes current is not discontinuous. (requires R <= 220µh * max(on_time, off_time)).
-        // note3: Assumes current does not change sign during pwm operation.
-#if defined(STIM_DYNAMIC_VOLTAGE)
-        float dtcomp = DEADTIME_COMPENSATION_PERCENTAGE * BSP_ReadVBus();
-#elif defined(STIM_STATIC_VOLTAGE)
-        float dtcomp = DEADTIME_COMPENSATION_PERCENTAGE * STIM_PSU_VOLTAGE;
-#endif
-        context[i % CONTEXT_SIZE].v1_cmd += (context[i % CONTEXT_SIZE].i1_cmd > 0 ? 1 : -1) * dtcomp;
-        context[i % CONTEXT_SIZE].v2_cmd += (context[i % CONTEXT_SIZE].i2_cmd > 0 ? 1 : -1) * dtcomp;
-        context[i % CONTEXT_SIZE].v3_cmd += (context[i % CONTEXT_SIZE].i3_cmd > 0 ? 1 : -1) * dtcomp;
-#endif
+        context[i % CONTEXT_SIZE].v1_cmd_quadrature = (v1 * q).imag();  // cmd voltage shifted 90 deg.
+        context[i % CONTEXT_SIZE].v2_cmd_quadrature = (v2 * q).imag();
+        context[i % CONTEXT_SIZE].v3_cmd_quadrature = (v3 * q).imag();
 
         atomic_signal_fence(std::memory_order_release);
         producer_index = i;
@@ -238,7 +226,7 @@ void ThreephaseModel::play_pulse(
         accumulate_errors();
     }
 
-    model_update(p1, p2, p3, v1, v2, v3);
+    model_update(p1, p2, p3);
 
     // update stats
     total_stats.current_max = {
@@ -315,25 +303,40 @@ void ThreephaseModel::interrupt_fn()
         }
     }
 
-    // compute duty cycle center
-    float v_min = min({
-        context[read_index].v1_cmd,
-        context[read_index].v2_cmd,
-        context[read_index].v3_cmd,
-    });
-    float v_max = max({
-        context[read_index].v1_cmd,
-        context[read_index].v2_cmd,
-        context[read_index].v3_cmd,
-    });
 #ifdef STIM_DYNAMIC_VOLTAGE
     float vbus = BSP_ReadVBus();
     pulse_stats.v_bus_max = max(pulse_stats.v_bus_max, vbus);
     pulse_stats.v_bus_min = min(pulse_stats.v_bus_min, vbus);
-    vbus = max(vbus, STIM_BOOST_VOLTAGE_LOW_THRESHOLD);
 #else
     float vbus = STIM_PSU_VOLTAGE;
 #endif
+
+#if defined(DEADTIME_COMPENSATION_ENABLE)
+    auto dtcomp = [&](float voltage, float current) {
+        float comp_percent = 0;
+        if (current >= DEADTIME_COMPENSATION_CURRENT_THRESHOLD) {
+            comp_percent = DEADTIME_COMPENSATION_PERCENTAGE;
+        }
+        else if (current <= -DEADTIME_COMPENSATION_CURRENT_THRESHOLD) {
+            comp_percent = -DEADTIME_COMPENSATION_PERCENTAGE;
+        } else {
+            comp_percent = DEADTIME_COMPENSATION_PERCENTAGE * current / DEADTIME_COMPENSATION_CURRENT_THRESHOLD;
+        }
+        return voltage + comp_percent * vbus;
+    };
+#else
+    auto dtcomp = [&](float voltage, float current) {
+        return voltage;
+    };
+#endif
+    float v1 = dtcomp(context[read_index].v1_cmd, context[read_index].i1_cmd);
+    float v2 = dtcomp(context[read_index].v2_cmd, context[read_index].i2_cmd);
+    float v3 = dtcomp(context[read_index].v3_cmd, context[read_index].i3_cmd);
+
+    // compute duty cycle center
+    float v_min = min({v1, v2, v3});
+    float v_max = max({v1, v2, v3});
+
     float center = vbus / 2;
     if (center + v_max > (vbus * STIM_PWM_MAX_DUTY_CYCLE)) {
         center = (vbus * STIM_PWM_MAX_DUTY_CYCLE) - v_max;
@@ -341,9 +344,9 @@ void ThreephaseModel::interrupt_fn()
 
     // write pwm
     BSP_SetPWM3(
-        (context[read_index].v1_cmd + center) / vbus, // TODO: precompute?
-        (context[read_index].v2_cmd + center) / vbus,
-        (context[read_index].v3_cmd + center) / vbus
+        (v1 + center) / vbus,
+        (v2 + center) / vbus,
+        (v3 + center) / vbus
     );
 
     // read currents
@@ -430,7 +433,7 @@ void ThreephaseModel::accumulate_errors()
     phase_IQ_3 += Complex(context[i].v3_cmd, context[i].v3_cmd_quadrature) * context[i].i3_meas;
 }
 
-void ThreephaseModel::model_update(Complex p1, Complex p2, Complex p3, Complex v1, Complex v2, Complex v3)
+void ThreephaseModel::model_update(Complex p1, Complex p2, Complex p3)
 {
 // update impedance magnitude
     {
@@ -458,9 +461,9 @@ void ThreephaseModel::model_update(Complex p1, Complex p2, Complex p3, Complex v
         float step_size = interpolate(error_ratio, 0.01f, 0.3f, .1f, 1.0f); // 1% error = 0.1 step. 30% error = 1.0 step
 
         // gradient descent update step. Change impedance magnitude only
-        z1 = Complex(std::abs(z1) - step_size * std::abs(v1) * (meas_1 - cmd_1), 0);
-        z2 = Complex(std::abs(z2) - step_size * std::abs(v2) * (meas_2 - cmd_2), 0);
-        z3 = Complex(std::abs(z3) - step_size * std::abs(v3) * (meas_3 - cmd_3), 0);
+        z1 = Complex(std::abs(z1) - step_size * std::abs(p1 * z1) * (meas_1 - cmd_1), 0);
+        z2 = Complex(std::abs(z2) - step_size * std::abs(p2 * z2) * (meas_2 - cmd_2), 0);
+        z3 = Complex(std::abs(z3) - step_size * std::abs(p3 * z3) * (meas_3 - cmd_3), 0);
 
         // // debug SLOW
         // static int i = 0;
@@ -491,35 +494,31 @@ void ThreephaseModel::model_update(Complex p1, Complex p2, Complex p3, Complex v
         // slowly converge to new parameters
         float learning_rate = .01f;
         if (std::abs(p1) > minimum_current_for_update) {
-            phase_IQ_sum_1 = phase_IQ_sum_1 * (1 - learning_rate) + phase_IQ_1 * learning_rate;
+            phase_IQ_avg_1 = phase_IQ_avg_1 * (1 - learning_rate) + phase_IQ_1 * learning_rate;
         }
         if (std::abs(p2) > minimum_current_for_update) {
-            phase_IQ_sum_2 = phase_IQ_sum_2 * (1 - learning_rate) + phase_IQ_2 * learning_rate;
+            phase_IQ_avg_2 = phase_IQ_avg_2 * (1 - learning_rate) + phase_IQ_2 * learning_rate;
         }
         if (std::abs(p3) > minimum_current_for_update) {
-            phase_IQ_sum_3 = phase_IQ_sum_3 * (1 - learning_rate) + phase_IQ_3 * learning_rate;
+            phase_IQ_avg_3 = phase_IQ_avg_3 * (1 - learning_rate) + phase_IQ_3 * learning_rate;
         }
 
         // clamp to avoid problems near zero.
         float minimum_magnitude = 0.01f; // ~watt, meaning really low power.
-        if (std::abs(phase_IQ_sum_1) <= minimum_magnitude) {
-            phase_IQ_sum_1 *= minimum_magnitude / std::abs(phase_IQ_1);
+        if (std::abs(phase_IQ_avg_1) <= minimum_magnitude) {
+            phase_IQ_avg_1 *= minimum_magnitude / std::abs(phase_IQ_avg_1);
         }
-        if (std::abs(phase_IQ_sum_2) <= minimum_magnitude) {
-            phase_IQ_sum_2 *= minimum_magnitude / std::abs(phase_IQ_2);
+        if (std::abs(phase_IQ_avg_2) <= minimum_magnitude) {
+            phase_IQ_avg_2 *= minimum_magnitude / std::abs(phase_IQ_avg_2);
         }
-        if (std::abs(phase_IQ_sum_3) <= minimum_magnitude) {
-            phase_IQ_sum_3 *= minimum_magnitude / std::abs(phase_IQ_3);
+        if (std::abs(phase_IQ_avg_3) <= minimum_magnitude) {
+            phase_IQ_avg_3 *= minimum_magnitude / std::abs(phase_IQ_avg_3);
         }
 
         // overwrite impedance with new phase angle
-        // TODO: why is conj needed?
-        float estimated_angle1 = std::arg(std::conj(phase_IQ_sum_1));
-        float estimated_angle2 = std::arg(std::conj(phase_IQ_sum_2));
-        float estimated_angle3 = std::arg(std::conj(phase_IQ_sum_3));
-        z1 = std::abs(z1) * Complex(cosf(estimated_angle1), sinf(estimated_angle1));
-        z2 = std::abs(z2) * Complex(cosf(estimated_angle2), sinf(estimated_angle2));
-        z3 = std::abs(z3) * Complex(cosf(estimated_angle3), sinf(estimated_angle3));
+        z1 = std::polar(std::abs(z1), std::arg(phase_IQ_avg_1));
+        z2 = std::polar(std::abs(z2), std::arg(phase_IQ_avg_2));
+        z3 = std::polar(std::abs(z3), std::arg(phase_IQ_avg_3));
     }
 
     // constrain impedance magnitude/angle

@@ -6,6 +6,7 @@
 #include "user_interface/images/battery.xbm"
 #include "user_interface/images/battery_empty.xbm"
 #include "user_interface/images/battery_empty2.xbm"
+#include "user_interface/images/padlock.xbm"
 
 #include "stim_clock.h"
 #include "bsp/bsp.h"
@@ -77,16 +78,23 @@ void UserInterface::repaint()
             display.setCursor(0, -2);
             display.print("power:");
 
-            int a = int(power);
+            int vol_1000 = int(power * 1000 + 0.5f);
+
+            int a = vol_1000 / 10;
             display.setTextSize(3);
             display.setCursor(0, 11);
             display.printf("%02i", a);
 
-            int b = int(power * 10) % 10;
+            int b = vol_1000 % 10;
             if (a < 100) {
                 display.setTextSize(1);
                 display.setCursor(12*3 - 2, 25);
                 display.printf(".%1i", b);
+            }
+
+            if (locked) {
+                int height = std::clamp<int>(padlock_height * (1 - unlock_progress) + 0.5f, 1, padlock_height);
+                display.drawXBitmap(40, 0, padlock_bits, padlock_width, height, SSD1306_WHITE);
             }
         break;
     }
@@ -126,6 +134,7 @@ void UserInterface::repaint()
         }
 
         case UIState::SelfTestError:
+        case UIState::FirmwareUpdate:
         break;
     }
 
@@ -174,6 +183,15 @@ void UserInterface::repaint()
 
             display.setCursor(0, 0);
             display.print(error_string);
+            break;
+        case UIState::FirmwareUpdate:
+            // display.setCursor(128 - 6*15, 31-7);
+            display.setCursor(0, 0);
+            display.print("Firmware update");
+            display.setCursor(0, 8);
+            display.print("Remove electrodes!");
+            display.setCursor(0, 24);
+            display.printf("stm32 v%i.%i.%i", focstim_api_version_major, focstim_api_version_minor, focstim_api_version_revision);
             break;
     }
 }

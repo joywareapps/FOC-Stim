@@ -39,7 +39,6 @@ public:
             return focstim_rpc_Errors_ERROR_ALREADY_PLAYING;
         }
 
-        time_since_signal_start.reset();
         BSP_OutputEnable(true, true, true);
         play_status = PlayStatus::PlayingThreephase;
         return focstim_rpc_Errors_ERROR_UNKNOWN;
@@ -55,7 +54,7 @@ public:
 
     virtual bool capability_threephase() {return true;};
     virtual bool capability_fourphase() {return false;};
-    virtual bool capability_potmeter() {return true;};
+    virtual bool capability_device_volume() {return true;};
     virtual bool capability_battery() {return false;};
     virtual bool capability_lsm6dsox() {return false;};
 
@@ -72,8 +71,6 @@ public:
         };
         transmit_message(message);
     }
-
-    Clock time_since_signal_start;
 };
 
 ESC1ProtobufAPI protobuf{};
@@ -192,7 +189,7 @@ void loop()
         && abs(BSP_ReadPotentiometerPercentage() - potentiometer_notification_lastvalue) >= 0.001f);
     if (do_transmit_potmeter) {
         float pot = BSP_ReadPotentiometerPercentage();
-        protobuf.transmit_notification_potentiometer(powf(pot, 1.f/2));
+        protobuf.transmit_notification_device_volume(powf(pot, 1.f/2), false);
         potentiometer_notification_nospam.reset();
         potentiometer_notification_lastvalue = pot;
     }
@@ -296,7 +293,8 @@ void loop()
     model3.play_pulse(points3.p1, points3.p2, points3.p3,
         pulse_carrier_frequency,
         pulse_width, pulse_rise,
-        driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN);
+        driving_current_amps + ESTOP_CURRENT_LIMIT_MARGIN,
+        STIM_PWM_MAX_VDRIVE);
 
     // store stats
     total_pulse_length_timer.step();
@@ -305,8 +303,8 @@ void loop()
     // store trace
     {
         traceline->skipped_update_steps = model3.skipped_update_steps;
-        traceline->v_drive = model3.pulse_stats.v_drive;
-        v_drive_max = max(v_drive_max, model3.pulse_stats.v_drive);
+        traceline->v_drive = model3.pulse_stats.v_drive_actual;
+        v_drive_max = max(v_drive_max, model3.pulse_stats.v_drive_actual);
         auto current_max = model3.pulse_stats.current_max;
         traceline->i_max_a = current_max.a;
         traceline->i_max_b = current_max.b;
@@ -361,8 +359,12 @@ void loop()
     // send notification: pulse stats
     if (pulse_counter % 50 == 40) {
         // transmit_notification
-        protobuf.transmit_notification_signal_stats(actual_pulse_frequency, v_drive_max);
+        protobuf.transmit_notification_signal_stats(
+            actual_pulse_frequency, v_drive_max,
+            std::min(1.f, model3.total_stats.volt_seconds / MODEL_MAXIMUM_VOLT_SECONDS),
+            std::min(1.f, v_drive_max / STIM_PWM_MAX_VDRIVE));
         v_drive_max = 0;
+        model3.total_stats.volt_seconds = 0;
     }
 }
 

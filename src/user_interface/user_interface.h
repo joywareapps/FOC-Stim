@@ -21,6 +21,7 @@ public:
 		Playing,
 		Error,
 		SelfTestError,
+		FirmwareUpdate,
 	};
 
 	UserInterface();
@@ -45,6 +46,16 @@ public:
 		dirty |= power != this->power;
 		this->power = power;
 	}
+	void setLockState(bool locked) {
+		dirty |= locked != this->locked;
+		this->locked = locked;
+	}
+	void setUnlockProgress(float unlock_progress) {
+		if (locked) {
+			dirty |= unlock_progress != this->unlock_progress;
+		}
+		this->unlock_progress = unlock_progress;
+	}
 	void setBatteryPresent(bool is_present) {
 		dirty |= is_present != this->battery_is_present;
 		this->battery_is_present = is_present;
@@ -68,7 +79,9 @@ private:
 	Adafruit_SSD1306 display;
 	UIState state;
 
-	float power;
+	float power;	// (0, 1)
+	bool locked;
+	float unlock_progress;
 	bool battery_is_present;
 	float battery_soc;
 	uint32_t ip;
